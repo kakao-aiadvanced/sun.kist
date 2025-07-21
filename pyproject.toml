@@ -8,7 +8,10 @@ packages = [{include = "sun"}]
 
 [tool.poetry.dependencies]
 python = "^3.11"
-openai = "^1.97.0"
+llmlingua = "^0.2.2"
+openai = "1.3.7"
+promptbench = "^0.0.4"
+httpx = "0.27.2"
 
 
 [tool.poetry.group.dev.dependencies]
