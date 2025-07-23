@@ -13,6 +13,17 @@ from langgraph.graph import START, END
 from tavily import TavilyClient
 from langgraph.graph import StateGraph
 
+# 환경 변수 로드
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # .env 파일이 있으면 로드
+except ImportError:
+    print("python-dotenv not installed, using system environment variables")
+
+print("openai_key", os.getenv("OPENAI_API_KEY"))
+print("tavily_key", os.getenv("TAVILY_API_KEY"))
+
 
 def build_vectorstore():
     urls = [
@@ -73,13 +84,18 @@ class NewGraphState(TypedDict):
     failed_reason: str
 
 
-retriever = build_vectorstore()
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-tavily_api_key = os.getenv("TAVILY_API_KEY")
-tavily = TavilyClient(api_key=tavily_api_key)
+def get_llm():
+    """LLM 인스턴스 반환"""
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
-def docs_retrieval(state: NewGraphState) -> NewGraphState:
+def get_tavily_client():
+    """Tavily 클라이언트 반환"""
+    tavily_api_key = os.getenv("TAVILY_API_KEY")
+    return TavilyClient(api_key=tavily_api_key)
+
+
+def docs_retrieval(state: NewGraphState, retriever) -> NewGraphState:
     """
     - 문서 검색
     """
@@ -103,7 +119,7 @@ def docs_retrieval(state: NewGraphState) -> NewGraphState:
     }
 
 
-def relevance_check(state: NewGraphState) -> NewGraphState:
+def relevance_check(state: NewGraphState, llm) -> NewGraphState:
     """
     - 문서 관련성 체크
     - 문서 관련성 체크 결과 반환
@@ -224,7 +240,7 @@ def check_relevance_routing(
         return "go_to_tavily_search"
 
 
-def tavily_search(state: NewGraphState) -> NewGraphState:
+def tavily_search(state: NewGraphState, tavily) -> NewGraphState:
     """
     - 타빌리 검색
     """
@@ -242,7 +258,7 @@ def tavily_search(state: NewGraphState) -> NewGraphState:
     }
 
 
-def generate_answer(state: NewGraphState) -> NewGraphState:
+def generate_answer(state: NewGraphState, llm) -> NewGraphState:
     """
     - 답변 생성
     """
@@ -277,7 +293,7 @@ def generate_answer(state: NewGraphState) -> NewGraphState:
     return {"generation": result}
 
 
-def hallucination_check(state: NewGraphState) -> NewGraphState:
+def hallucination_check(state: NewGraphState, llm) -> NewGraphState:
     """
     - 환상 체크
     """
@@ -404,69 +420,79 @@ def set_failed_answer(state: NewGraphState) -> NewGraphState:
         return {"final_answer": "failed: not relevant"}  # 기본 실패 메시지
 
 
-workflow = StateGraph(NewGraphState)
+def build_workflow(retriever, llm, tavily):
+    """워크플로우 구축"""
+    workflow = StateGraph(NewGraphState)
 
-# 노드 추가
-workflow.add_node("docs_retrieval", docs_retrieval)
+    # 노드 추가 (partial을 사용해서 추가 인자들을 바인딩)
+    workflow.add_node("docs_retrieval", lambda state: docs_retrieval(state, retriever))
+    workflow.add_node("relevance_check", lambda state: relevance_check(state, llm))
+    workflow.add_node("count_relevance_check", count_relevance_check)
+    workflow.add_node("tavily_search", lambda state: tavily_search(state, tavily))
+    workflow.add_node("generate_answer", lambda state: generate_answer(state, llm))
+    workflow.add_node(
+        "hallucination_check", lambda state: hallucination_check(state, llm)
+    )
+    workflow.add_node("count_hallucination_check", count_hallucination_check)
+    workflow.add_node("set_failed_answer", set_failed_answer)
 
-# 연관성 체크
-workflow.add_node("relevance_check", relevance_check)
-workflow.add_node("count_relevance_check", count_relevance_check)
+    # 엣지 추가
+    workflow.add_edge(START, "docs_retrieval")
+    workflow.add_edge("docs_retrieval", "relevance_check")
+    workflow.add_edge("count_relevance_check", "relevance_check")
+    workflow.add_conditional_edges(
+        "relevance_check",
+        check_relevance_routing,
+        {
+            "go_to_tavily_search": "tavily_search",
+            "go_to_generate_answer": "generate_answer",
+            "go_to_relevance_check": "count_relevance_check",
+            "set_failed_answer": "set_failed_answer",
+        },
+    )
+    workflow.add_edge("tavily_search", "relevance_check")
+    workflow.add_edge("generate_answer", "count_hallucination_check")
+    workflow.add_edge("count_hallucination_check", "hallucination_check")
+    workflow.add_conditional_edges(
+        "hallucination_check",
+        hallucination_check_routing,
+        {
+            "go_to_generate_answer": "generate_answer",
+            "go_to_hallucination_check": "count_hallucination_check",
+            "set_failed_answer": "set_failed_answer",
+            "go_to_end": END,
+        },
+    )
+    workflow.add_edge("set_failed_answer", END)
 
-# 타빌리 검색
-workflow.add_node("tavily_search", tavily_search)
-
-# 답변 생성
-workflow.add_node("generate_answer", generate_answer)
-
-# 환상 체크
-workflow.add_node("hallucination_check", hallucination_check)
-workflow.add_node("count_hallucination_check", count_hallucination_check)
-
-# 실패 메시지 설정
-workflow.add_node("set_failed_answer", set_failed_answer)
-
-# 엣지 추가
-workflow.add_edge(START, "docs_retrieval")
-workflow.add_edge("docs_retrieval", "relevance_check")
-workflow.add_edge("count_relevance_check", "relevance_check")
-workflow.add_conditional_edges(
-    "relevance_check",
-    check_relevance_routing,
-    {
-        "go_to_tavily_search": "tavily_search",
-        "go_to_generate_answer": "generate_answer",
-        "go_to_relevance_check": "count_relevance_check",
-        "set_failed_answer": "set_failed_answer",
-    },
-)
-workflow.add_edge("tavily_search", "relevance_check")
-workflow.add_edge("generate_answer", "count_hallucination_check")
-workflow.add_edge("count_hallucination_check", "hallucination_check")
-workflow.add_conditional_edges(
-    "hallucination_check",
-    hallucination_check_routing,
-    {
-        "go_to_generate_answer": "generate_answer",
-        "go_to_hallucination_check": "count_hallucination_check",
-        "set_failed_answer": "set_failed_answer",
-        "go_to_end": END,
-    },
-)
-workflow.add_edge("set_failed_answer", END)
+    return workflow.compile()
 
 
-app = workflow.compile()
-from pprint import pprint
+def query_for_agent(query: str, progress_callback=None) -> str | None:
+    """에이전트 실행 함수"""
+    retriever = build_vectorstore()
+    llm = get_llm()
+    tavily = get_tavily_client()
+    app = build_workflow(retriever, llm, tavily)
 
-
-def query_for_agent(query: str) -> str | None:
     result = None
+    step_count = 0
+
     for output in app.stream({"query": query}):
         for key, value in output.items():
-            pprint(f"Finished running: {key}")
+            step_count += 1
+            if progress_callback:
+                progress_callback(step_count, key)
+
             result = value.get("final_answer", None)
+            if result:
+                break
+
     return result
 
 
-print(query_for_agent("Where does Messi play right now?"))
+# 직접 실행될 때만 테스트 코드 실행
+if __name__ == "__main__":
+    from pprint import pprint
+
+    print(query_for_agent("Where does Messi play right now?"))
